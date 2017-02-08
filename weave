@@ -50,6 +50,7 @@ weave launch        <same arguments as 'weave launch-router'>
                       [--ipalloc-init <mode>]
                       [--ipalloc-range <cidr> [--ipalloc-default-subnet <cidr>]]
                       [--log-level=debug|info|warning|error]
+                      [--no-detach]
                       <peer> ...
       launch-proxy  [-H <endpoint>] [--without-dns] [--no-multicast-route]
                       [--no-rewrite-hosts] [--no-default-ipalloc] [--no-restart]
@@ -58,8 +59,10 @@ weave launch        <same arguments as 'weave launch-router'>
                       [--hostname-replacement <replacement>]
                       [--rewrite-inspect]
                       [--log-level=debug|info|warning|error]
+                      [--no-detach]
       launch-plugin [--no-restart] [--no-multicast-route]
                       [--log-level=debug|info|warning|error]
+                      [--no-detach]
 
 weave prime
 
@@ -363,6 +366,8 @@ PROXY_PORT=12375
 PROXY_CONTAINER_NAME=weaveproxy
 COVERAGE_ARGS=""
 [ -n "$COVERAGE" ] && COVERAGE_ARGS="-test.coverprofile=/home/weave/cover.prof --"
+# By default, detach from containers when running
+DETACH=-d
 
 ######################################################################
 # general helpers; independent of docker and weave
@@ -1487,6 +1492,9 @@ proxy_parse_args() {
           --no-restart)
             RESTART_POLICY=
             ;;
+          --no-detach)
+            DETACH=
+            ;;
           *)
             PROXY_ARGS="$PROXY_ARGS $1"
             ;;
@@ -1565,6 +1573,11 @@ common_launch_args() {
             --log-level=*)
                 args="$args $1"
                 ;;
+            --no-detach)
+                echo "ERROR: --no-detach only works when running individual components." >&2
+                echo "You should either run launch-router/proxy/plugin or drop --no-detach." >&2
+                exit 1
+                ;;
         esac
         shift
     done
@@ -1632,6 +1645,9 @@ launch_router() {
                 AWSVPC_ARGS="--awsvpc"
                 AWSVPC=1
                 ;;
+            --no-detach)
+                DETACH=
+                ;;
             *)
                 ARGS="$ARGS '$(echo "$1" | sed "s|'|'\"'\"'|g")'"
                 ;;
@@ -1688,7 +1704,7 @@ launch_router() {
     # Set WEAVE_DOCKER_ARGS in the environment in order to supply
     # additional parameters, such as resource limits, to docker
     # when launching the weave container.
-    ROUTER_CONTAINER=$(docker run -d --name=$CONTAINER_NAME \
+    ROUTER_CONTAINER=$(docker run $DETACH --name=$CONTAINER_NAME \
         $(docker_run_options) \
         $RESTART_POLICY \
         --volumes-from $DB_CONTAINER_NAME \
@@ -1706,9 +1722,11 @@ launch_router() {
         --status-addr $STATUS_ADDR \
         --resolv-conf "/var/run/weave/etc/$RESOLV_CONF_BASE" \
         "$@")
-    wait_for_status $CONTAINER_NAME http_call $HTTP_ADDR
-    setup_awsvpc
-    populate_router
+    if [ -n "$DETACH" ]; then
+        wait_for_status $CONTAINER_NAME http_call $HTTP_ADDR
+        setup_awsvpc
+        populate_router
+    fi
 }
 
 setup_awsvpc() {
@@ -1769,7 +1787,7 @@ launch_proxy() {
     fi
     detect_awsvpc
     [ -n "$AWSVPC" ] && PROXY_ARGS="$PROXY_ARGS --no-multicast-route"
-    PROXY_CONTAINER=$(docker run -d --name=$PROXY_CONTAINER_NAME \
+    PROXY_CONTAINER=$(docker run $DETACH --name=$PROXY_CONTAINER_NAME \
         $(docker_run_options) \
         $RESTART_POLICY \
         --pid=host \
@@ -1783,7 +1801,9 @@ launch_proxy() {
         -e EXEC_IMAGE=$EXEC_IMAGE \
         --entrypoint=/home/weave/weaveproxy \
         $WEAVEPROXY_DOCKER_ARGS $EXEC_IMAGE $COVERAGE_ARGS $PROXY_ARGS)
-    wait_for_status $PROXY_CONTAINER_NAME http_call_unix $PROXY_CONTAINER_NAME status.sock
+    if [ -n "$DETACH" ]; then
+        wait_for_status $PROXY_CONTAINER_NAME http_call_unix $PROXY_CONTAINER_NAME status.sock
+    fi
 }
 
 stop_proxy() {
@@ -1796,6 +1816,9 @@ launch_plugin_if_not_running() {
         case "$1" in
             --no-restart)
                 RESTART_POLICY=
+                ;;
+            --no-detach)
+                DETACH=
                 ;;
             *)
                 break
@@ -1811,7 +1834,7 @@ launch_plugin_if_not_running() {
     # Any other kind of error code from check_not_running is a failure.
     [ $retval -gt 0 ] && return $retval
 
-    if ! PLUGIN_CONTAINER=$(docker run -d --name=$PLUGIN_CONTAINER_NAME \
+    if ! PLUGIN_CONTAINER=$(docker run $DETACH --name=$PLUGIN_CONTAINER_NAME \
         $(docker_run_options) \
         $RESTART_POLICY \
         --pid=host \
@@ -1821,9 +1844,11 @@ launch_plugin_if_not_running() {
         "$@") ; then
         return 1
     fi
-    wait_for_status $PLUGIN_CONTAINER_NAME http_call_unix $PLUGIN_CONTAINER_NAME status.sock
-    WEAVE_IPAM_SUBNET=$(call_weave GET /ipinfo/defaultsubnet)
-    util_op create-plugin-network weave weavemesh $WEAVE_IPAM_SUBNET
+    if [ -n "$DETACH" ]; then
+        wait_for_status $PLUGIN_CONTAINER_NAME http_call_unix $PLUGIN_CONTAINER_NAME status.sock
+        WEAVE_IPAM_SUBNET=$(call_weave GET /ipinfo/defaultsubnet)
+        util_op create-plugin-network weave weavemesh $WEAVE_IPAM_SUBNET
+    fi
 }
 
 plugin_disabled() {
@@ -2124,7 +2149,7 @@ EOF
         done
         collect_cidr_args "$@"
         shift $CIDR_ARG_COUNT
-        CONTAINER=$(docker run -e WEAVE_CIDR=none $DNS_ARGS -d "$@")
+        CONTAINER=$(docker run -e WEAVE_CIDR=none $DNS_ARGS $DETACH "$@")
         create_bridge
         ipam_cidrs_or_die allocate $CONTAINER $CIDR_ARGS
         [ -n "$REWRITE_HOSTS" ] && extra_hosts_args "$@" && rewrite_etc_hosts $DNS_EXTRA_HOSTS
